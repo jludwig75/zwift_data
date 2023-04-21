@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use env_logger::Builder;
-use html_parser::Dom;
+use html_parser::{Dom, Node};
 use log::{debug, LevelFilter};
 use zwift_data::html_query;
 
@@ -34,9 +34,31 @@ async fn main() -> Result<()> {
         for row in &rows {
             let cells = html_query::find(row, if first_row { "th" } else { "td" }).await?;
             for cell in &cells {
-                println!("CELL: {:#?}", cell);
+                let mut text_found = false;
+                for child in &cell.children {
+                    if let Node::Text(text) = child {
+                        print!("{text},");
+                        text_found = true;
+                        break;
+                    } else if let Node::Element(element) = child {
+                        if element.name == "a" {
+                            for child in &element.children {
+                                if let Node::Text(text) = child {
+                                    print!("{text},");
+                                    text_found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !text_found {
+                    for child in &cell.children {
+                        print!("{:?}", child);
+                    }
+                }
             }
-            println!("===============================");
+            println!();
             first_row = false;
         }
     }

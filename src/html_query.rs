@@ -3,6 +3,7 @@ use std::vec;
 use anyhow::{anyhow, Result};
 use async_recursion::async_recursion;
 use html_parser::{Dom, Element, Node};
+use log::debug;
 
 pub async fn find<'a>(element: &'a Element, selectors_string: &str) -> Result<Vec<&'a Element>> {
     find_elements(element, &parse_selector_string(selectors_string)?).await
@@ -56,7 +57,7 @@ enum Selector {
 }
 
 fn parse_individual_selector_string(selector_string: &str) -> Result<BasicSelector> {
-    println!("selector_string = {}", selector_string);
+    debug!("selector_string = {}", selector_string);
     // Must not contain white space
     assert!(!selector_string.contains(char::is_whitespace));
     // Must also not contain . after first charactet
@@ -140,7 +141,7 @@ fn parse_selector_string(selector_string: &str) -> Result<Vec<Selector>> {
         }
     }
 
-    println!("Selectors: {:#?}", selectors);
+    debug!("Selectors: {:#?}", selectors);
 
     Ok(selectors)
 }
@@ -168,7 +169,7 @@ fn element_matches_basic_selector(element: &Element, basic_selector: &BasicSelec
             }
         }
         BasicSelector::ElementWithClasses(tag, class_list) => {
-            println!("Checking if {element:#?} matches selector {basic_selector:?}");
+            debug!("Checking if {element:#?} matches selector {basic_selector:?}");
             *tag == element.name
                 && class_list
                     .iter()
