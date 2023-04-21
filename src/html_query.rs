@@ -24,17 +24,27 @@ pub async fn select<'a>(dom: &'a Dom, selectors_string: &str) -> Result<Vec<&'a 
 enum BasicSelector {
     All,
     Id(String),
-    Class(String),
     Element(String),
+    Class(String),
+    IdWithClasses(String, Vec<String>),
+    ElementWithClasses(String, Vec<String>),
+    ClassList(Vec<String>),
 }
 
 impl Clone for BasicSelector {
     fn clone(&self) -> Self {
         match self {
             BasicSelector::All => BasicSelector::All,
-            BasicSelector::Id(str) => BasicSelector::Id(str.clone()),
-            BasicSelector::Class(str) => BasicSelector::Class(str.clone()),
-            BasicSelector::Element(str) => BasicSelector::Element(str.clone()),
+            BasicSelector::Id(string) => BasicSelector::Id(string.clone()),
+            BasicSelector::Element(string) => BasicSelector::Element(string.clone()),
+            BasicSelector::Class(string) => BasicSelector::Class(string.clone()),
+            BasicSelector::IdWithClasses(string, class_list) => {
+                BasicSelector::IdWithClasses(string.clone(), class_list.clone())
+            }
+            BasicSelector::ElementWithClasses(string, class_list) => {
+                BasicSelector::ElementWithClasses(string.clone(), class_list.clone())
+            }
+            BasicSelector::ClassList(class_list) => BasicSelector::ClassList(class_list.clone()),
         }
     }
 }
@@ -43,16 +53,12 @@ impl Clone for BasicSelector {
 enum Selector {
     Basic(BasicSelector),
     Hierarchical(Vec<BasicSelector>),
-    Intersection(Vec<BasicSelector>),
 }
 
 fn parse_individual_selector_string(selector_string: &str) -> Result<BasicSelector> {
+    println!("selector_string = {}", selector_string);
     // Must not contain white space
-    assert!(
-        !selector_string.contains(' ')
-            && !selector_string.contains('\t')
-            && !selector_string.contains('\n')
-    );
+    assert!(!selector_string.contains(char::is_whitespace));
     // Must also not contain . after first charactet
     assert!(!selector_string[1..].contains('.'));
     if selector_string == "*" {
@@ -81,20 +87,52 @@ fn parse_individual_selector_string(selector_string: &str) -> Result<BasicSelect
     }
 }
 
+fn parese_complex_selector(selector_string: &str) -> Result<BasicSelector> {
+    assert!(!selector_string.contains(char::is_whitespace));
+    let mut class_parts: Vec<_> = selector_string.split('.').collect();
+    match class_parts.len() {
+        0 => Err(anyhow!("Invalid query string: {}", selector_string)),
+        1 => Ok(parse_individual_selector_string(selector_string)?),
+        _ => {
+            if class_parts.len() == 2 && class_parts[0].is_empty() {
+                // It's a single class selector
+                Ok(parse_individual_selector_string(selector_string)?)
+            } else {
+                // Determine what the first selector type is
+                let first_selector = if class_parts[0].is_empty() {
+                    class_parts = class_parts[1..].to_vec();
+                    format!(".{}", class_parts[1])
+                } else {
+                    class_parts[0].to_string()
+                };
+                let basic_selector = parse_individual_selector_string(&first_selector)?;
+                match basic_selector {
+                    BasicSelector::All => Err(anyhow!("Invalid selector \"{selector_string}\": Selector cannot contain * and other selectors")),
+                    BasicSelector::Element(element) => Ok(BasicSelector::ElementWithClasses(element, class_parts[1..].iter().map(|s| s.to_string()).collect())),
+                    BasicSelector::Id(id) => Ok(BasicSelector::IdWithClasses(id, class_parts[1..].iter().map(|s| s.to_string()).collect())),
+                    BasicSelector::Class(_) => Ok(BasicSelector::ClassList(class_parts.iter().map(|s| s.to_string()).collect())),
+                    BasicSelector::IdWithClasses(_, _) | BasicSelector::ElementWithClasses(_, _) | BasicSelector::ClassList(_) => Err(anyhow!("Internal parse error: {}", selector_string)),
+                }
+            }
+        }
+    }
+}
+
 fn parse_selector_string(selector_string: &str) -> Result<Vec<Selector>> {
     let mut selectors = Vec::new();
     for item in selector_string.split(',') {
         let selector_strings: Vec<_> = item.split_ascii_whitespace().collect();
         match selector_strings.len() {
             0 => return Err(anyhow!("Invalid query string: {}", selector_string)),
-            1 => selectors.push(Selector::Basic(parse_individual_selector_string(
+            1 => selectors.push(Selector::Basic(parese_complex_selector(
                 selector_strings[0],
             )?)),
             _ => {
                 // White space seperated selectors are hierarchical.
                 let mut hierarchical_selectors = Vec::new();
                 for selector_string in selector_strings {
-                    hierarchical_selectors.push(parse_individual_selector_string(selector_string)?)
+                    let basic_selector = parese_complex_selector(selector_string)?;
+                    hierarchical_selectors.push(basic_selector);
                 }
                 assert!(hierarchical_selectors.len() > 1);
                 selectors.push(Selector::Hierarchical(hierarchical_selectors));
@@ -117,8 +155,28 @@ fn element_matches_basic_selector(element: &Element, basic_selector: &BasicSelec
                 false
             }
         }
-        BasicSelector::Class(class) => element.classes.contains(class),
         BasicSelector::Element(tag) => *tag == element.name,
+        BasicSelector::Class(class) => element.classes.contains(class),
+        BasicSelector::IdWithClasses(id, class_list) => {
+            if let Some(element_id) = &element.id {
+                *id == *element_id
+                    && class_list
+                        .iter()
+                        .all(|class| element.classes.contains(class))
+            } else {
+                false
+            }
+        }
+        BasicSelector::ElementWithClasses(tag, class_list) => {
+            println!("Checking if {element:#?} matches selector {basic_selector:?}");
+            *tag == element.name
+                && class_list
+                    .iter()
+                    .all(|class| element.classes.contains(class))
+        }
+        BasicSelector::ClassList(class_list) => class_list
+            .iter()
+            .all(|class| element.classes.contains(class)),
     }
 }
 
@@ -135,40 +193,19 @@ async fn find_elements_for_selector<'a>(
                 Ok(vec![])
             }
         }
-        Selector::Intersection(basic_selectors) => {
-            let mut matches = true;
-            for basic_selector in basic_selectors {
-                if !element_matches_basic_selector(element, basic_selector) {
-                    matches = false;
-                    break;
-                }
-            }
-            if matches {
-                Ok(vec![element])
-            } else {
-                Ok(vec![])
-            }
-        }
         Selector::Hierarchical(basic_selectors) => {
-            println!(
-                "Looking for hierarchical selector {:?} at element {:?}",
-                selector, element
-            );
             if element_matches_basic_selector(element, &basic_selectors[0]) {
-                println!("First hierarchical selector matches");
                 if basic_selectors.len() == 1 {
                     Ok(vec![element])
                 } else {
-                    let basic_selector_list = basic_selectors.clone()[1..].to_vec();
+                    let hierarchical_selector =
+                        Selector::Hierarchical(basic_selectors.clone()[1..].to_vec());
                     let mut elements = Vec::new();
                     for child in &element.children {
                         if let Node::Element(element) = child {
                             elements.append(
-                                &mut find_elements_for_selector(
-                                    element,
-                                    &Selector::Hierarchical(basic_selector_list.clone()),
-                                )
-                                .await?,
+                                &mut find_elements_for_selector(element, &hierarchical_selector)
+                                    .await?,
                             );
                         }
                     }
@@ -225,7 +262,7 @@ mod test {
   <p class="intro">Introduction</p>
     <ul>
       <li class="item">Item 1</li>
-      <li class="item">Item 2</li>
+      <li class="item extra">Item 2</li>
     </ul>
 </div>"#;
 
@@ -236,16 +273,17 @@ mod test {
     //  ".title"            <h1 class="title">...</h1>
     //  "h1"                <h1 class="title">...</h1>
     //  "ul"                <ul>...</ul>
-    //  "li"                <li class="item">Item 1</li>, <li class="item">Item 2</li>
+    //  "li"                <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
     //  "#myDiv,h1"         <h1 class="title">...</h1>
-    //  "h1,p"             <h1 class="title">...</h1>, <p class="intro">...</p>
-    //  "ul,li"            <ul>...</ul>, <li class="item">Item 1</li>, <li class="item">Item 2</li>
-    //  "#myDiv .item"      <li class="item">Item 1</li>, <li class="item">Item 2</li>
+    //  "h1,p"              <h1 class="title">...</h1>, <p class="intro">...</p>
+    //  "ul,li"             <ul>...</ul>, <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
+    //  "#myDiv .item"      <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
     //  "#myDiv h1"         <h1 class="title">...</h1>
-
-        TODO: Add support for this. Need to find out rules.
-    //  "li.item"           <li class="item">Item 1</li>, <li class="item">Item 2</li>
-    //  "#myDiv,li.item"    <li class="item">Item 1</li>, <li class="item">Item 2</li>
+    //  "li.item"           <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
+    //  "#myDiv li.extra"   <li class="item extra">Item 2</li>
+    //  "#myDiv li.item"    <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
+    //  "li.item.extra"     <li class="item extra">Item 2</li>
+    //  ".item.extra"       <li class="item extra">Item 2</li>
     */
 
     #[tokio::test]
@@ -279,7 +317,7 @@ mod test {
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0].name, "ul");
 
-        //  "li"                <li class="item">Item 1</li>, <li class="item">Item 2</li>
+        //  "li"                <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
         let elements = select(&dom, "li").await.unwrap();
         assert_eq!(elements.len(), 2);
 
@@ -316,7 +354,7 @@ mod test {
             Node::Text("Introduction".to_string())
         );
 
-        //  "ul,li"            <ul>...</ul>, <li class="item">Item 1</li>, <li class="item">Item 2</li>
+        //  "ul,li"            <ul>...</ul>, <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
         let elements = select(&dom, "ul,li").await.unwrap();
         assert_eq!(elements.len(), 3);
 
@@ -330,7 +368,7 @@ mod test {
         assert!(elements[2].classes.contains(&"item".to_string()));
         assert_eq!(elements[2].children[0], Node::Text("Item 2".to_string()));
 
-        //  "#myDiv .item"      <li class="item">Item 1</li>, <li class="item">Item 2</li>
+        //  "#myDiv .item"      <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
         let elements = select(&dom, "#myDiv .item").await.unwrap();
         assert_eq!(elements.len(), 2);
 
@@ -343,6 +381,58 @@ mod test {
         assert_eq!(elements[1].children[0], Node::Text("Item 2".to_string()));
 
         //  "#myDiv h1"         <h1 class="title">...</h1>
+        let elements = select(&dom, "#myDiv h1").await.unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].name, "h1");
+        assert!(elements[0].classes.contains(&"title".to_string()));
+
+        //  "li.item"           <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
+        let elements = select(&dom, "li.item").await.unwrap();
+        assert_eq!(elements.len(), 2);
+
+        assert_eq!(elements[0].name, "li");
+        assert!(elements[0].classes.contains(&"item".to_string()));
+        assert_eq!(elements[0].children[0], Node::Text("Item 1".to_string()));
+
+        assert_eq!(elements[1].name, "li");
+        assert!(elements[1].classes.contains(&"item".to_string()));
+        assert_eq!(elements[1].children[0], Node::Text("Item 2".to_string()));
+
+        //  "#myDiv li.item"    <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
+        let elements = select(&dom, "#myDiv li.item").await.unwrap();
+        assert_eq!(elements.len(), 2);
+
+        assert_eq!(elements[0].name, "li");
+        assert!(elements[0].classes.contains(&"item".to_string()));
+        assert_eq!(elements[0].children[0], Node::Text("Item 1".to_string()));
+
+        assert_eq!(elements[1].name, "li");
+        assert!(elements[1].classes.contains(&"item".to_string()));
+        assert_eq!(elements[1].children[0], Node::Text("Item 2".to_string()));
+
+        //  "#myDiv li.extra"    <li class="item">Item 1</li>, <li class="item extra">Item 2</li>
+        let elements = select(&dom, "#myDiv li.extra").await.unwrap();
+        assert_eq!(elements.len(), 1);
+
+        assert_eq!(elements[0].name, "li");
+        assert!(elements[0].classes.contains(&"item".to_string()));
+        assert_eq!(elements[0].children[0], Node::Text("Item 2".to_string()));
+
+        //  "li.item.extra"                <li class="item extra">Item 2</li>
+        let elements = select(&dom, "li.item.extra").await.unwrap();
+        assert_eq!(elements.len(), 1);
+
+        assert_eq!(elements[0].name, "li");
+        assert!(elements[0].classes.contains(&"item".to_string()));
+        assert_eq!(elements[0].children[0], Node::Text("Item 2".to_string()));
+
+        //  ".item.extra"       <li class="item extra">Item 2</li>
+        let elements = select(&dom, ".item.extra").await.unwrap();
+        assert_eq!(elements.len(), 1);
+
+        assert_eq!(elements[0].name, "li");
+        assert!(elements[0].classes.contains(&"item".to_string()));
+        assert_eq!(elements[0].children[0], Node::Text("Item 2".to_string()));
     }
 
     #[tokio::test]
